@@ -4,6 +4,7 @@ const File = std.fs.File;
 const clap = @import("zig-clap");
 
 const OutStream = io.OutStream(std.os.WriteError);
+const BitInStream = io.BitInStream(std.builtin.Endian.Big, io.SliceInStream.Error);
 
 const start_code = [3]u8{ 0, 0, 1 };
 
@@ -71,98 +72,103 @@ fn pad(out: *OutStream, s: []const u8, n: usize) !void {
 
 // FIXME: Workaround for padding strings
 fn output(out: *OutStream, name: []const u8, raw: var, n: var, typ: []const u8) !void {
-    try pad(out, name, 25);
+    try pad(out, name, 50);
     try out.print(" ");
     try pad(out, typ, 10);
     try out.print(" {b:>8} = {}\n", raw, n);
 }
 
-const FieldType = union(enum) {
-    Int: Int,
-    ExpGobel: ExpGobel,
-};
-
-const Int = struct {
-    bits: comptime_int,
-    signed: bool = false,
-
-    fn get_type(comptime self: *const Int) type {
-        return @Type(std.builtin.TypeInfo{ .Int = std.builtin.TypeInfo.Int{ .is_signed = self.signed, .bits = self.bits } });
-    }
-};
-
-const ExpGobel = struct {
-    signed: bool = false,
-};
-
-const NalField = struct {
-    name: []const u8,
-    typ: FieldType,
-};
-
-fn parse(buf: []const u8, out: *OutStream, comptime fields: []const NalField) ![]const u8 {
-    var slice_stream = io.SliceInStream.init(buf);
-    var stream = io.BitInStream(std.builtin.Endian.Big, io.SliceInStream.Error).init(&slice_stream.stream);
-    var bits: usize = 0;
-    inline for (fields) |field| {
-        switch (field.typ) {
-            .Int => |int| {
-                const typ = int.get_type();
-                const val = stream.readBits(typ, int.bits, &bits);
-                var typ_buf: [8]u8 = undefined;
-                const type_s = try std.fmt.bufPrint(&typ_buf, "u({})", @intCast(u16, int.bits));
-                try output(out, field.name, val, val, type_s);
-            },
-            .ExpGobel => |eg| {
-                var num_zeros: u6 = 0;
-                var read: usize = 0;
-                while (true) : (num_zeros += 1) {
-                    const b = try stream.readBits(u1, 1, &bits);
-                    read = (read << 1) | b;
-                    if (b == 1)
-                        break;
-                }
-                const further_bits = try stream.readBits(usize, num_zeros, &bits);
-                read = (read << num_zeros) | further_bits;
-                const val = std.math.pow(usize, 2, num_zeros) - 1 + further_bits;
-                var typ_buf: [8]u8 = undefined;
-                const type_s = try std.fmt.bufPrint(&typ_buf, "ue({})", num_zeros * 2 + 1);
-                try output(out, field.name, read, val, type_s);
-            },
-        }
-    }
-    return buf[slice_stream.pos..];
+fn int_type(comptime bits: comptime_int) type {
+    return @Type(std.builtin.TypeInfo{ .Int = std.builtin.TypeInfo.Int{ .is_signed = false, .bits = bits } });
 }
 
-fn u(comptime bits: comptime_int) FieldType {
-    return FieldType{ .Int = Int{ .bits = bits } };
+fn u(stream: *BitInStream, out: *OutStream, name: []const u8, comptime bits: comptime_int) !int_type(bits) {
+    const typ = int_type(bits);
+    var bit_target: usize = undefined;
+    const val = stream.readBits(typ, bits, &bit_target);
+    var typ_buf: [8]u8 = undefined;
+    const type_s = try std.fmt.bufPrint(&typ_buf, "u({})", @intCast(u16, bits));
+    try output(out, name, val, val, type_s);
+    return val;
 }
 
-fn ue() FieldType {
-    return FieldType{ .ExpGobel = ExpGobel{} };
+fn ue(stream: *BitInStream, out: *OutStream, name: []const u8) !usize {
+    var num_zeros: u6 = 0;
+    var read: usize = 0;
+    var bits: usize = undefined;
+    while (true) : (num_zeros += 1) {
+        const b = try stream.readBits(u1, 1, &bits);
+        read = (read << 1) | b;
+        if (b == 1)
+            break;
+    }
+    const further_bits = try stream.readBits(usize, num_zeros, &bits);
+    read = (read << num_zeros) | further_bits;
+    const val = std.math.pow(usize, 2, num_zeros) - 1 + further_bits;
+    var typ_buf: [8]u8 = undefined;
+    const type_s = try std.fmt.bufPrint(&typ_buf, "ue({})", num_zeros * 2 + 1);
+    try output(out, name, read, val, type_s);
+    return val;
 }
 
 pub fn parse_nal_header(buf: []const u8, f: File) ![]const u8 {
     std.debug.assert(std.mem.eql(u8, buf[0..3], start_code));
     const out = &f.outStream().stream;
-    return parse(buf[3..], out, [_]NalField{
-        NalField{ .name = "forbidden_zero_bit", .typ = u(1) },
-        NalField{ .name = "nal_ref_idc", .typ = u(2) },
-        NalField{ .name = "nal_unit_type", .typ = u(5) },
-    });
+    var slice_stream = io.SliceInStream.init(buf[3..]);
+    var stream = BitInStream.init(&slice_stream.stream);
+
+    _ = try u(&stream, out, "forbidden_zero_bit", 1);
+    _ = try u(&stream, out, "nal_ref_idc", 2);
+    _ = try u(&stream, out, "nal_unit_type", 5);
+
+    return buf[3 + slice_stream.pos ..];
 }
 
 pub fn parse_sps(buf: []const u8, f: File) ![]const u8 {
     const out = &f.outStream().stream;
-    return parse(buf, out, [_]NalField{
-        NalField{ .name = "profile_idc", .typ = u(8) },
-        NalField{ .name = "constraint_set0_flag", .typ = u(1) },
-        NalField{ .name = "constraint_set1_flag", .typ = u(1) },
-        NalField{ .name = "constraint_set2_flag", .typ = u(1) },
-        NalField{ .name = "reserved_zero_5bits", .typ = u(5) },
-        NalField{ .name = "level_idc", .typ = u(8) },
-        NalField{ .name = "seq_parameter_set_id", .typ = ue() },
-    });
+    var slice_stream = io.SliceInStream.init(buf);
+    var stream = BitInStream.init(&slice_stream.stream);
+
+    const profile_idc = try u(&stream, out, "profile_idc", 8);
+    _ = try u(&stream, out, "constraint_set0_flag", 1);
+    _ = try u(&stream, out, "constraint_set1_flag", 1);
+    _ = try u(&stream, out, "constraint_set2_flag", 1);
+    _ = try u(&stream, out, "constraint_set3_flag", 1);
+    _ = try u(&stream, out, "constraint_set4_flag", 1);
+    _ = try u(&stream, out, "constraint_set5_flag", 1);
+    _ = try u(&stream, out, "reserved_zero_2bits", 2);
+    _ = try u(&stream, out, "level_idc", 8);
+    _ = try ue(&stream, out, "seq_parameter_set_id");
+
+    if (profile_idc == 100 or profile_idc == 110 or
+        profile_idc == 122 or profile_idc == 244 or profile_idc == 44 or
+        profile_idc == 83 or profile_idc == 86 or profile_idc == 118 or
+        profile_idc == 128 or profile_idc == 138 or profile_idc == 139 or
+        profile_idc == 134)
+    {
+        const chroma_format_ide = try ue(&stream, out, "chroma_format_ide");
+        if (chroma_format_ide == 3)
+            _ = try u(&stream, out, "separate_colour_plane_flag", 1);
+        _ = try ue(&stream, out, "bit_depth_luma_minus8");
+        _ = try ue(&stream, out, "bit_depth_chroma_minus8");
+        _ = try u(&stream, out, "qpprime_y_zero_transform_bypass_flag", 1);
+        const seq_scaling_matrix_present_flag = try u(&stream, out, "seq_scaling_matrix_present_flag", 1);
+        if (seq_scaling_matrix_present_flag == 1) {
+            var i: usize = 0;
+            const max: usize = if (chroma_format_ide != 3) 8 else 12;
+            while (i < max) : (i += 1) {}
+            unreachable; // TODO
+        }
+        _ = try ue(&stream, out, "log2_max_frame_num_minus4");
+        const pic_order_cnt_type = try ue(&stream, out, "pic_order_cnt_type");
+        if (pic_order_cnt_type == 0) {
+            _ = try ue(&stream, out, "log2_max_pic_order_cnt_lsb_minus4");
+        } else if (pic_order_cnt_type == 1) {
+            _ = try u(&stream, out, "delta_pic_order_always_zero_flag", 1);
+        }
+    }
+
+    return buf[slice_stream.pos..];
 }
 
 pub fn main() !u8 {
