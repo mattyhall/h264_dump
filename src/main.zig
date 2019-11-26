@@ -8,10 +8,29 @@ const BitInStream = io.BitInStream(std.builtin.Endian.Big, io.SliceInStream.Erro
 
 const start_code = [3]u8{ 0, 0, 1 };
 
-fn skip_to_start_code(buf: []const u8) []const u8 {
+fn get_start_code_pos(buf: []const u8) usize {
     var i: usize = 0;
     while (buf.len >= i + 3 and !std.mem.eql(u8, buf[i .. i + 3], start_code)) : (i += 1) {}
+    return i;
+}
+
+fn skip_to_start_code(buf: []const u8) []const u8 {
+    const i = get_start_code_pos(buf);
     return buf[i..];
+}
+
+fn strip_emulation_prevention(dst: *std.ArrayList(u8), buf: []const u8) !void {
+    var i: usize = 0;
+    while (i < buf.len) : (i += 1) {
+        if (i + 2 < buf.len and std.mem.eql(u8, buf[i .. i + 3], [3]u8{ 0, 0, 3 })) {
+            try dst.append(buf[i]);
+            try dst.append(buf[i + 1]);
+            std.debug.assert(buf[i + 2] == 3);
+            i += 2;
+        } else {
+            try dst.append(buf[i]);
+        }
+    }
 }
 
 const UnitType = enum {
@@ -407,7 +426,12 @@ pub fn main() !u8 {
             try stdout.print("{}\n", types[unit_type]);
         } else {
             try stdout.print("===== {} =====\n", types[unit_type]);
-            var parser = UnitParser.init(slice, stdout);
+            var next_pos = 3 + get_start_code_pos(slice[3..]) + 1;
+            var one_unit = slice[0..next_pos];
+            var arrayList = std.ArrayList(u8).init(allocator);
+            defer arrayList.deinit();
+            try strip_emulation_prevention(&arrayList, one_unit);
+            var parser = UnitParser.init(arrayList.toSliceConst(), stdout);
             try parser.parse();
         }
         slice = skip_to_start_code(slice[3..]);
