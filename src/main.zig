@@ -62,9 +62,10 @@ const types = [_][]const u8{
 };
 
 fn pad(out: *OutStream, s: []const u8, n: usize) !void {
-    std.debug.assert(n >= s.len);
-    var i = n - s.len;
     try out.print("{}", s);
+    if (s.len > n)
+        return;
+    var i = n - s.len;
     while (i > 0) : (i -= 1) {
         try out.print(" ");
     }
@@ -107,6 +108,8 @@ const UnitParser = struct {
         const typ = try self.u("nal_unit_type", 5);
         if (typ == @enumToInt(UnitType.SPS)) {
             try self.parse_sps();
+        } else if (typ == @enumToInt(UnitType.PPS)) {
+            try self.parse_pps();
         }
     }
 
@@ -269,6 +272,29 @@ const UnitParser = struct {
         _ = try self.u("cpb_removal_delay_length_minus1", 5);
         _ = try self.u("dpb_output_delay_length_minus1", 5);
         _ = try self.u("time_offset_length", 5);
+    }
+
+    fn parse_pps(self: *Self) !void {
+        _ = try self.ue("pic_parameter_set_id");
+        _ = try self.ue("seq_parameter_set_id");
+        _ = try self.u("entropy_coding_mode_flag", 1);
+        _ = try self.u("bottom_field_pic_order_in_frame_present_flag", 1);
+        const num_slice_groups_minus1 = try self.ue("num_slice_groups_minus1");
+        if (num_slice_groups_minus1 > 1) {
+            const slice_group_map_type = try self.ue("slice_group_map_type");
+            // TODO
+            unreachable;
+        }
+        _ = try self.ue("num_ref_idx10_default_active_minus1");
+        _ = try self.ue("num_ref_idx11_default_active_minus1");
+        _ = try self.u("weighted_pred_flag", 1);
+        _ = try self.u("weighted_bipred_idc", 2);
+        _ = try self.se("pic_init_qp_minus26");
+        _ = try self.se("pic_init_qs_minus26");
+        _ = try self.se("chroma_qp_index_offset");
+        _ = try self.u("deblocking_filter_control_present_flag", 1);
+        _ = try self.u("constrained_intra_pred_flag", 1);
+        _ = try self.u("redundant_pic_cnt_present_flag", 1);
     }
 
     fn u(self: *Self, name: []const u8, comptime bits: comptime_int) !int_type(bits) {
