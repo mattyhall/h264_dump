@@ -70,14 +70,6 @@ fn pad(out: *OutStream, s: []const u8, n: usize) !void {
     }
 }
 
-// FIXME: Workaround for padding strings
-fn output(out: *OutStream, name: []const u8, raw: var, n: var, typ: []const u8) !void {
-    try pad(out, name, 50);
-    try out.print(" ");
-    try pad(out, typ, 10);
-    try out.print(" {b:>8} = {}\n", raw, n);
-}
-
 fn int_type(comptime bits: comptime_int) type {
     return @Type(std.builtin.TypeInfo{ .Int = std.builtin.TypeInfo.Int{ .is_signed = false, .bits = bits } });
 }
@@ -192,18 +184,101 @@ const UnitParser = struct {
 
             const vui_parameters_present_flag = try self.u("vui_parameters_present_flag", 1);
             if (vui_parameters_present_flag == 1) {
-                // TODO
+                _ = try self.vui_parameters();
             }
         }
     }
 
+    fn vui_parameters(self: *Self) !void {
+        const aspect_ratio_info_present_flag = try self.u("aspect_ratio_info_present_flag", 1);
+        if (aspect_ratio_info_present_flag == 1) {
+            const aspect_ratio_idc = try self.u("aspect_ratio_idc", 8);
+            if (aspect_ratio_idc == 255) { // Extended_SAR
+                _ = try self.u("sar_width", 16);
+                _ = try self.u("sar_height", 16);
+            }
+        }
+
+        const overscan_info_present_flag = try self.u("overscan_info_present_flag", 1);
+        if (overscan_info_present_flag == 1)
+            _ = try self.u("overscan_appropriate_flag", 1);
+
+        const video_signal_type_present_flag = try self.u("video_signal_type_present_flag", 1);
+        if (video_signal_type_present_flag == 1) {
+            _ = try self.u("video_format", 3);
+            _ = try self.u("video_full_range_flag", 1);
+            const colour_description_present_flag = try self.u("colour_description_present_flag", 1);
+            if (colour_description_present_flag == 1) {
+                _ = try self.u("colour_primaries", 8);
+                _ = try self.u("transfer_characteristics", 8);
+                _ = try self.u("matrix_coefficients", 8);
+            }
+        }
+
+        const chroma_loc_info_present_flag = try self.u("chroma_loc_info_present_flag", 1);
+        if (chroma_loc_info_present_flag == 1) {
+            _ = try self.ue("chroma_sample_loc_type_top_field");
+            _ = try self.ue("chroma_sample_loc_type_bottom_field");
+        }
+
+        const timing_info_present_flag = try self.u("timing_info_present_flag", 1);
+        if (timing_info_present_flag == 1) {
+            _ = try self.u("num_units_in_tick", 32);
+            _ = try self.u("time_scale", 32);
+            _ = try self.u("fixed_frame_rate_flag", 1);
+        }
+
+        const nal_hrd_parameters_present_flag = try self.u("nal_hrd_parameters_present_flag", 1);
+        if (nal_hrd_parameters_present_flag == 1)
+            _ = try self.hrd_parameters();
+
+        const vcl_hrd_parameters_present_flag = try self.u("vcl_hrd_parameters_present_flag", 1);
+        if (vcl_hrd_parameters_present_flag == 1)
+            _ = try self.hrd_parameters();
+
+        if (nal_hrd_parameters_present_flag == 1 or
+            vcl_hrd_parameters_present_flag == 1)
+            _ = try self.u("low_delay_hrd_flag", 1);
+
+        _ = try self.u("pic_struct_present_flag", 1);
+
+        const bitstream_restriction_flag = try self.u("bitstream_restriction_flag", 1);
+        if (bitstream_restriction_flag == 1) {
+            _ = try self.u("motion_vectors_over_pic_boundaries_flag", 1);
+            _ = try self.ue("max_bytes_per_pic_denom");
+            _ = try self.ue("max_bits_per_mb_denom");
+            _ = try self.ue("log2_max_mv_length_horizontal");
+            _ = try self.ue("log2_max_mb_length_vertical");
+            _ = try self.ue("max_num_reorder_frames");
+            _ = try self.ue("max_dec_frame_buffering");
+        }
+    }
+
+    fn hrd_parameters(self: *Self) !void {
+        const cpb_cnt_minus1 = try self.ue("cpb_cnt_minus1");
+        _ = try self.u("bit_rate_scale", 4);
+        _ = try self.u("cpb_size_scale", 4);
+        var sched_sel_idx: usize = 0;
+        while (sched_sel_idx <= cpb_cnt_minus1) : (sched_sel_idx += 1) {
+            // TODO names
+            _ = try self.ue("bit_rate_value_minus1");
+            _ = try self.ue("cpb_rate_value_minus1");
+            _ = try self.u("cbr_flag", 1);
+        }
+        _ = try self.u("initial_cpb_removal_delay_length_minus1", 5);
+        _ = try self.u("cpb_removal_delay_length_minus1", 5);
+        _ = try self.u("dpb_output_delay_length_minus1", 5);
+        _ = try self.u("time_offset_length", 5);
+    }
+
     fn u(self: *Self, name: []const u8, comptime bits: comptime_int) !int_type(bits) {
+        const pos = self.get_pos();
         const typ = int_type(bits);
         var bit_target: usize = undefined;
         const val = self.stream.readBits(typ, bits, &bit_target);
         var typ_buf: [8]u8 = undefined;
         const type_s = try std.fmt.bufPrint(&typ_buf, "u({})", @intCast(u16, bits));
-        try output(self.out, name, val, val, type_s);
+        try self.output(pos, name, val, val, type_s);
         return val;
     }
 
@@ -228,21 +303,40 @@ const UnitParser = struct {
     }
 
     fn ue(self: *Self, name: []const u8) !usize {
+        const pos = self.get_pos();
         const res = try self.eg();
         var typ_buf: [8]u8 = undefined;
         const type_s = try std.fmt.bufPrint(&typ_buf, "ue({})", res.zeros * 2 + 1);
-        try output(self.out, name, res.read, res.val, type_s);
+        try self.output(pos, name, res.read, res.val, type_s);
         return res.val;
     }
 
     fn se(self: *Self, name: []const u8) !isize {
+        const pos = self.get_pos();
         const res = try self.eg();
         var typ_buf: [8]u8 = undefined;
         const type_s = try std.fmt.bufPrint(&typ_buf, "se({})", res.zeros * 2 + 1);
         const k = @intCast(isize, res.val);
         const val = std.math.pow(isize, -1, k + 1) * @floatToInt(isize, std.math.ceil(@intToFloat(f32, k) / 2.0));
-        try output(self.out, name, res.read, val, type_s);
+        try self.output(pos, name, res.read, val, type_s);
         return val;
+    }
+
+    fn get_pos(self: *Self) usize {
+        const bit_pos = (8 - @intCast(usize, self.stream.bit_count));
+        if (bit_pos == 8) {
+            return (self.slice_stream.pos - 3) * 8;
+        } else {
+            return (self.slice_stream.pos - 4) * 8 + bit_pos;
+        }
+    }
+
+    fn output(self: *Self, pos: usize, name: []const u8, raw: var, n: var, typ: []const u8) !void {
+        try self.out.print("{:<8} ", pos);
+        try pad(self.out, name, 40);
+        try self.out.print(" ");
+        try pad(self.out, typ, 10);
+        try self.out.print(" {b:>32} = {}\n", raw, n);
     }
 };
 
